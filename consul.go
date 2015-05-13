@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/hashicorp/consul/command"
-	"github.com/hashicorp/consul/command/agent"
-	"github.com/mitchellh/cli"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/command"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/command/agent"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/mitchellh/cli"
 )
 
 // Commands is the mapping of all the available Consul commands.

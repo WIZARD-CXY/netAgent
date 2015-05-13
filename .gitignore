@@ -28,3 +28,6 @@ _testmain.go
 
 # Test data
 data-dir/
+
+# tags
+.tags*

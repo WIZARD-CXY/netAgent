@@ -7,16 +7,18 @@ import (
 	b64 "encoding/base64"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/api"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/command"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/watch"
+	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/mitchellh/cli"
 	"github.com/golang/glog"
-	_ "github.com/hashicorp/consul/api"
-	_ "github.com/hashicorp/consul/command"
-	"github.com/hashicorp/consul/watch"
-	"github.com/mitchellh/cli"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
+	"reflect"
 	"time"
 )
 
@@ -76,13 +78,39 @@ func startConsul(serverMode bool, bootstrap bool, bindAddress string, dataDir st
 		args = append(args, "-advertise")
 		args = append(args, bindAddress)
 	}
+	args = append(args)
 
 	ret := Execute(args...)
 
 	eCh <- ret
 }
 
+// Execute function is borrowed from Consul's main.go
+func Execute(args ...string) int {
+	cli := &cli.CLI{
+		Args:     args,
+		Commands: Commands,
+		HelpFunc: cli.BasicHelpFunc("consul"),
+	}
+
+	exitCode, err := cli.Run()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error executing CLI: %s\n", err.Error())
+		return 1
+	}
+
+	return exitCode
+}
+
 // Node operation related
+
+type Node struct {
+	Name    string `json:"Name,omitempty"`
+	Address string `json:"Addr,ommitempty"`
+}
+
+const CONSUL_CATALOG_BASE_URL = "http://localhost:8500/v1/catalog/"
+
 func Join(addr string) error {
 	ret := Execute("join", addr)
 
@@ -102,13 +130,6 @@ func Leave() error {
 		return errors.New("Error leaving consul cluster")
 	}
 	return nil
-}
-
-const CONSUL_CATALOG_BASE_URL = "http://localhost:8500/v1/catalog/"
-
-type Node struct {
-	Name    string `json:"Name,omitempty"`
-	Address string `json:"Addr,ommitempty"`
 }
 
 func getNodes() ([]Node, error) {
@@ -135,34 +156,6 @@ func getNodes() ([]Node, error) {
 
 	return nodes, nil
 
-}
-
-// Execute function is borrowed from Consul's main.go
-func Execute(args ...string) int {
-
-	for _, arg := range args {
-		if arg == "-v" || arg == "--version" {
-			newArgs := make([]string, len(args)+1)
-			newArgs[0] = "version"
-			copy(newArgs[1:], args)
-			args = newArgs
-			break
-		}
-	}
-
-	cli := &cli.CLI{
-		Args:     args,
-		Commands: Commands,
-		HelpFunc: cli.BasicHelpFunc("consul"),
-	}
-
-	exitCode, err := cli.Run()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error executing CLI: %s\n", err.Error())
-		return 1
-	}
-
-	return exitCode
 }
 
 // K/V store
@@ -194,10 +187,9 @@ func Get(store string, key string) ([]byte, int, bool) {
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		var jsonBody []KVRespBody
 
-		fmt.Printf("haha %+v %+v", jsonBody, resp.Body)
+		err = json.NewDecoder(resp.Body).Decode(&jsonBody)
 
-		body, err := ioutil.ReadAll(resp.Body)
-		err = json.Unmarshal(body, &jsonBody)
+		//fmt.Printf("haha %+v %+v\n", jsonBody, resp.Body)
 
 		existingValue, err := b64.StdEncoding.DecodeString(jsonBody[0].Value)
 
@@ -219,6 +211,7 @@ const (
 )
 
 // return val indicate the error type
+// need old val
 func Put(store string, key string, value []byte, oldVal []byte) int {
 
 	existingVal, casIndex, ok := Get(store, key)
@@ -304,33 +297,234 @@ type Listener interface {
 	NotifyStoreUpdate(NotifyUpdateType, string, map[string][]byte)
 }
 
-// enaListener implement Listener Interface
-type enaListener struct {
+func contains(wType WatchType, key string, elem interface{}) bool {
+	ws, ok := watches[wType]
+	if !ok {
+		return false
+	}
+
+	list, ok := ws.listeners[key]
+
+	if !ok {
+		return false
+	}
+
+	v := reflect.ValueOf(list)
+
+	for i := 0; i < v.Len(); i++ {
+		if v.Index(i).Interface() == elem {
+			return true
+		}
+
+	}
+	return false
 }
 
-/*func (e enaListener) NotifyNodeUpdate(nType NotifyUpdateType, nodeAddress string) {
-	if nType == NOTIFY_UPDATE_ADD && !started {
-		populateKVStoreFromCache()
+type watchconsul bool
+
+func addListener(wtype WatchType, key string, listener Listener) watchconsul {
+	var wc watchconsul = false
+	if !contains(WATCH_TYPE_NODE, key, listener) {
+		ws, ok := watches[wtype]
+		if !ok {
+			watches[wtype] = watchData{make(map[string][]Listener), make([]*watch.WatchPlan, 0)}
+			ws = watches[wtype]
+		}
+
+		listeners, ok := ws.listeners[key]
+		if !ok {
+			listeners = make([]Listener, 0)
+			wc = true
+		}
+		ws.listeners[key] = append(listeners, listener)
+	}
+	return wc
+}
+
+func getListeners(wtype WatchType, key string) []Listener {
+	ws, ok := watches[wtype]
+	if !ok {
+		return nil
+	}
+
+	list, ok := ws.listeners[key]
+	if ok {
+		return list
+	}
+	return nil
+}
+
+func addWatchPlan(wtype WatchType, wp *watch.WatchPlan) {
+	ws, ok := watches[wtype]
+	if !ok {
+		return
+	}
+
+	ws.watchPlans = append(ws.watchPlans, wp)
+	watches[wtype] = ws
+}
+
+func stopWatches() {
+	for _, ws := range watches {
+		for _, wp := range ws.watchPlans {
+			wp.Stop()
+		}
+		ws.watchPlans = ws.watchPlans[:0]
 	}
 }
 
-func (e enaListener) NotifyKeyUpdate(nType NotifyUpdateType, key string, data []byte) {
+func register(wtype WatchType, params map[string]interface{}, handler watch.HandlerFunc) {
+	// Create the watch
+	wp, err := watch.Parse(params)
+	if err != nil {
+		fmt.Printf("Register error : %s", err)
+		return
+	}
+	addWatchPlan(wtype, wp)
+	wp.Handler = handler
+	cmdFlags := flag.NewFlagSet("watch", flag.ContinueOnError)
+	httpAddr := command.HTTPAddrFlag(cmdFlags)
+	// Run the watch
+	if err := wp.Run(*httpAddr); err != nil {
+		fmt.Printf("Error querying Consul agent: %s", err)
+	}
 }
-func (e enaListener) NotifyStoreUpdate(nType NotifyUpdateType, store string, data map[string][]byte) {
-}*/
+
+var nodeCache []*api.Node
+
+func compare(X, Y []*api.Node) []*api.Node {
+	m := make(map[string]bool)
+
+	for _, y := range Y {
+		m[y.Address] = true
+	}
+
+	var ret []*api.Node
+	for _, x := range X {
+		if m[x.Address] {
+			continue
+		}
+		ret = append(ret, x)
+	}
+
+	return ret
+}
+
+func updateNodeListeners(clusterNodes []*api.Node) {
+	toDelete := compare(nodeCache, clusterNodes)
+	toAdd := compare(clusterNodes, nodeCache)
+	nodeCache = clusterNodes
+	listeners := getListeners(WATCH_TYPE_NODE, "")
+	if listeners == nil {
+		return
+	}
+	for _, deleteNode := range toDelete {
+		for _, listener := range listeners {
+			listener.NotifyNodeUpdate(NOTIFY_UPDATE_DELETE, deleteNode.Address)
+		}
+	}
+
+	for _, addNode := range toAdd {
+		for _, listener := range listeners {
+			listener.NotifyNodeUpdate(NOTIFY_UPDATE_ADD, addNode.Address)
+		}
+	}
+}
+
+func updateKeyListeners(idx uint64, key string, data interface{}) {
+	listeners := getListeners(WATCH_TYPE_KEY, key)
+	if listeners == nil {
+		return
+	}
+
+	var kv *api.KVPair = nil
+	var val []byte = nil
+	updateType := NOTIFY_UPDATE_MODIFY
+
+	if data != nil {
+		kv = data.(*api.KVPair)
+	}
+
+	if kv == nil {
+		updateType = NOTIFY_UPDATE_DELETE
+	} else {
+		updateType = NOTIFY_UPDATE_MODIFY
+		if idx == kv.CreateIndex {
+			updateType = NOTIFY_UPDATE_ADD
+		}
+		val = kv.Value
+	}
+
+	for _, listener := range listeners {
+		listener.NotifyKeyUpdate(NotifyUpdateType(updateType), key, val)
+	}
+}
+
+func registerForNodeUpdates() {
+	// Compile the watch parameters
+	params := make(map[string]interface{})
+	params["type"] = "nodes"
+	handler := func(idx uint64, data interface{}) {
+		updateNodeListeners(data.([]*api.Node))
+	}
+	register(WATCH_TYPE_NODE, params, handler)
+}
+
+func RegisterForNodeUpdates(listener Listener) {
+	wc := addListener(WATCH_TYPE_NODE, "", listener)
+	if wc {
+		registerForNodeUpdates()
+	}
+}
+
+func registerForKeyUpdates(absKey string) {
+	params := make(map[string]interface{})
+	params["type"] = "key"
+	params["key"] = absKey
+	handler := func(idx uint64, data interface{}) {
+		updateKeyListeners(idx, absKey, data)
+	}
+	register(WATCH_TYPE_KEY, params, handler)
+}
+
+func RegisterForKeyUpdates(store string, key string, listener Listener) {
+	absKey := store + "/" + key
+	wc := addListener(WATCH_TYPE_KEY, absKey, listener)
+	if wc {
+		registerForKeyUpdates(absKey)
+	}
+}
+
+func registerForStoreUpdates(store string) {
+	// Compile the watch parameters
+	params := make(map[string]interface{})
+	params["type"] = "keyprefix"
+	params["prefix"] = store + "/"
+	handler := func(idx uint64, data interface{}) {
+		fmt.Println("NOT IMPLEMENTED Store Update :", idx, data)
+	}
+	register(WATCH_TYPE_STORE, params, handler)
+}
+
+func RegisterForStoreUpdates(store string, listener Listener) {
+	wc := addListener(WATCH_TYPE_STORE, store, listener)
+	if wc {
+		registerForStoreUpdates(store)
+	}
+}
 
 func watchForExistingRegisteredUpdates() {
 	for wType, ws := range watches {
-		glog.Info("watchForExistingRegisteredUpdates : ", wType)
+		glog.Infof("watchForExistingRegisteredUpdates : ", wType)
 		for key, _ := range ws.listeners {
-			glog.Info("key : ", key)
+			glog.Infof("key : ", key)
 			switch wType {
 			case WATCH_TYPE_NODE:
-				//go registerForNodeUpdates()
+				go registerForNodeUpdates()
 			case WATCH_TYPE_KEY:
-				//go registerForKeyUpdates(key)
+				go registerForKeyUpdates(key)
 			case WATCH_TYPE_STORE:
-				//go registerForStoreUpdates(key)
+				go registerForStoreUpdates(key)
 			}
 		}
 	}
