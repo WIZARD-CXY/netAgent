@@ -2,8 +2,20 @@ package netAgent
 
 import (
 	"bytes"
+	"flag"
+	"os"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	flag.Set("alsologtostderr", "true")
+	flag.Set("log_dir", "/tmp")
+	flag.Set("v", "3")
+	flag.Parse()
+
+	ret := m.Run()
+	os.Exit(ret)
+}
 
 func TestStartAgent(t *testing.T) {
 	err := StartAgent(true, true, "", "data-dir")

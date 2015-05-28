@@ -9,16 +9,17 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/golang/glog"
-	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/api"
-	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/command"
-	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/hashicorp/consul/watch"
-	"github.com/WIZARD-CXY/netAgent/Godeps/_workspace/src/github.com/mitchellh/cli"
+	"github.com/golang/glog"
+	"github.com/hashicorp/consul/api"
+	"github.com/hashicorp/consul/command"
+	"github.com/hashicorp/consul/watch"
+	"github.com/mitchellh/cli"
 	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
 	"reflect"
+	"strconv"
 	"time"
 )
 
@@ -170,6 +171,9 @@ type KVRespBody struct {
 	Value       string `json:Value,omitempty"`
 }
 
+// 1st return value as []byte
+// 2nd return its ModifyIndex
+// 3rd return ok or not
 func Get(store string, key string) ([]byte, int, bool) {
 	url := CONSUL_KV_BASE_URL + store + "/" + key
 
@@ -189,8 +193,6 @@ func Get(store string, key string) ([]byte, int, bool) {
 
 		err = json.NewDecoder(resp.Body).Decode(&jsonBody)
 
-		//fmt.Printf("haha %+v %+v\n", jsonBody, resp.Body)
-
 		existingValue, err := b64.StdEncoding.DecodeString(jsonBody[0].Value)
 
 		if err != nil {
@@ -204,6 +206,39 @@ func Get(store string, key string) ([]byte, int, bool) {
 	}
 }
 
+// get all key-value pairs in one store from backend
+func GetAll(store string) ([][]byte, []int, bool) {
+	url := CONSUL_KV_BASE_URL + store + "?recursive"
+
+	resp, err := http.Get(url)
+	defer resp.Body.Close()
+
+	if err != nil {
+		glog.Infof("Error in Get all KV %v", store)
+	}
+	fmt.Printf("Status of Get %s for %s\n", resp.Status, url)
+
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var jsonBody []KVRespBody
+
+		values := make([][]byte, 0)
+		indexes := make([]int, 0)
+
+		err = json.NewDecoder(resp.Body).Decode(&jsonBody)
+
+		for _, body := range jsonBody {
+			existingVal, _ := b64.StdEncoding.DecodeString(body.Value)
+			values = append(values, existingVal)
+			indexes = append(indexes, body.ModifyIndex)
+		}
+
+		return values, indexes, true
+	} else {
+		return nil, nil, false
+	}
+
+}
+
 const (
 	OK = iota
 	OUTDATED
@@ -211,7 +246,7 @@ const (
 )
 
 // return val indicate the error type
-// need old val
+// need old val as 4-th param
 func Put(store string, key string, value []byte, oldVal []byte) int {
 
 	existingVal, casIndex, ok := Get(store, key)
@@ -220,7 +255,7 @@ func Put(store string, key string, value []byte, oldVal []byte) int {
 		return OUTDATED
 	}
 
-	url := fmt.Sprintf("%s%s/%s?cas=%d", CONSUL_KV_BASE_URL, store, key, casIndex)
+	url := CONSUL_KV_BASE_URL + store + "/" + key + "?cas=" + strconv.Itoa(casIndex)
 	glog.Infof("Updating KV pair for %s %s %s %d", url, key, value, casIndex)
 
 	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(value))
