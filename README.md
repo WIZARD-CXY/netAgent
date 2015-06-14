@@ -1,3 +1,5 @@
+Deprecated!. Move to cxy-sdn for univeral management now
+
 # netAgent
 [![Travis](https://travis-ci.org/WIZARD-CXY/netAgent.svg?branch=master)](https://travis-ci.org/WIZARD-CXY/netAgent)
 
